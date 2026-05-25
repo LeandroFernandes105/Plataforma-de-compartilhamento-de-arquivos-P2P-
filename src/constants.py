@@ -1,0 +1,7 @@
+TRACKER_HOST = '127.0.0.1'
+TRACKER_PORT = 5000
+
+PEER_HOST = '127.0.0.1'
+
+SHARED_FOLDER = "shared"
+DOWNLOAD_FOLDER = "../downloads"

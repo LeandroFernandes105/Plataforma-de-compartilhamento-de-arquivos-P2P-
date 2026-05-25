@@ -1,10 +1,9 @@
+from constants import TRACKER_PORT
 import socket
 import threading
 import json
 
 HOST = '0.0.0.0'
-PORT = 5000
-
 
 files_index = {}
 
@@ -66,10 +65,10 @@ def handle_client(conn, addr):
 def start_tracker():
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((HOST, PORT))
+    server.bind((HOST, TRACKER_PORT))
     server.listen()
 
-    print(f"[TRACKER ONLINE] Porta {PORT}")
+    print(f"[TRACKER ONLINE] Porta {TRACKER_PORT}")
 
     while True:
 

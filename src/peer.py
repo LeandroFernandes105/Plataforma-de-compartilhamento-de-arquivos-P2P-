@@ -1,31 +1,33 @@
-import socket
+from constants import TRACKER_HOST, TRACKER_PORT, SHARED_FOLDER, DOWNLOAD_FOLDER, PEER_HOST
 import threading
+import socket
+import errno
 import json
+import sys
 import os
 
-TRACKER_HOST = '127.0.0.1'
-TRACKER_PORT = 5000
-
-PEER_HOST = '127.0.0.1'
-PEER_PORT = 6002
-
-SHARED_FOLDER = "shared"
-DOWNLOAD_FOLDER = "../downloads"
+try:
+    PEER_PORT = int(sys.argv[1])
+except ValueError:
+    raise Exception("Parâmetro informado é inválido")
 
 os.makedirs(SHARED_FOLDER, exist_ok=True)
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
-
 def upload_server():
 
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((PEER_HOST, PEER_PORT))
-    server.listen()
+    try:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind((PEER_HOST, PEER_PORT))
+        server.listen()
+    except OSError as e:
+            if e.errno == errno.EADDRINUSE:
+                print("A porta selecionada já está em uso")
+                os._exit(1)
 
     print(f"[PEER ONLINE] Porta {PEER_PORT}")
 
     while True:
-
         conn, addr = server.accept()
 
         thread = threading.Thread(
@@ -56,8 +58,6 @@ def send_file(conn):
 
     conn.close()
 
-
-
 def register_file(filename):
 
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -78,8 +78,6 @@ def register_file(filename):
 
     client.close()
 
-
-
 def search_file(filename):
 
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -97,8 +95,6 @@ def search_file(filename):
     client.close()
 
     return response["peers"]
-
-
 
 def download_file(filename):
 
@@ -131,8 +127,6 @@ def download_file(filename):
     client.close()
 
     print(f"[DOWNLOAD FINALIZADO] {filename}")
-
-
 
 threading.Thread(target=upload_server, daemon=True).start()
 
