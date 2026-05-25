@@ -33,7 +33,7 @@ peer/
 Abra um terminal na pasta principal do projeto e execute:
 
 ```bash
-python tracker/tracker.py
+python src/tracker.py
 ```
 
 O tracker ficará aguardando conexões dos peers.
@@ -43,17 +43,16 @@ O tracker ficará aguardando conexões dos peers.
 Abra outro terminal e execute:
 
 ```bash
-python peer/peer.py
+python src/peer.py {PORTA}
 ```
-
-Esse peer pode registrar arquivos no tracker e compartilhar arquivos com outros peers.
+Onde `{PORTA}` deve ser substituído pelo número desejado da porta que rodará o peer, que pode registrar arquivos no tracker e compartilhar arquivos com outros peers.
 
 ### 3. Executar o segundo peer
 
 Abra mais um terminal e execute:
 
 ```bash
-python peer/peer1.py
+python src/peer.py {PORTA2}
 ```
 
 Esse segundo peer pode buscar e baixar arquivos compartilhados pelo primeiro peer.
