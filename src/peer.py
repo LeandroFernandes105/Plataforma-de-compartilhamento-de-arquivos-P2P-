@@ -60,6 +60,12 @@ def send_file(conn):
 
 def register_file(filename):
 
+    filepath = os.path.join(SHARED_FOLDER, filename)
+
+    if not os.path.exists(filepath):
+        print(f"o arquivo '{filename}' não existe na pasta shared.")
+        return
+
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     client.connect((TRACKER_HOST, TRACKER_PORT))
 
