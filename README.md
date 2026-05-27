@@ -132,6 +132,3 @@ src/shared/teste.txt
 Pasta onde são salvos os arquivos baixados.
 
 Essa pasta é gerada durante os testes e não precisa ser versionada no Git.
-- Arthur
-- Gabriel
-- Leandro
