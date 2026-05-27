@@ -1,79 +1,137 @@
-# Protótipo de Plataforma de Compartilhamento de Arquivos P2P
+# Plataforma de Compartilhamento de Arquivos P2P
 
-Este projeto é um protótipo de uma aplicação de compartilhamento de arquivos no modelo P2P, desenvolvido em Python.
+Este projeto é um protótipo de uma plataforma de compartilhamento de arquivos baseada no modelo Peer-to-Peer (P2P), desenvolvido em Python.
 
-A ideia principal é permitir que diferentes peers compartilhem arquivos entre si com o auxílio de um tracker central. O tracker não armazena os arquivos; ele apenas registra quais peers possuem determinado arquivo. Quando um peer deseja baixar um arquivo, ele consulta o tracker para descobrir quem possui esse arquivo e, em seguida, realiza o download diretamente do outro peer.
+A aplicação permite simular uma rede P2P simples, na qual um peer registra um arquivo em um tracker, outro peer consulta esse tracker para localizar o arquivo e, em seguida, realiza o download diretamente do peer que possui o conteúdo.
 
-Nesta versão inicial, o protótipo possui as funcionalidades mínimas para validar a comunicação entre os componentes do sistema: registrar arquivos, buscar arquivos disponíveis e realizar o download entre peers.
+O tracker não armazena os arquivos. Ele atua apenas como um catálogo, registrando quais peers possuem determinados arquivos. A transferência dos arquivos ocorre diretamente entre os peers.
+
+## Funcionalidades do protótipo
+
+- Registro de arquivos no tracker;
+- Busca de arquivos disponíveis na rede;
+- Download direto entre peers;
+- Simulação de dois peers locais;
+- Interface de demonstração em Streamlit;
+- Comunicação entre processos usando sockets TCP;
+- Uso de threads para manter os peers disponíveis para conexões.
 
 ## Tecnologias utilizadas
 
-- Python
-- Sockets TCP
-- Threads
-- JSON
+- Python;
+- Sockets TCP;
+- Threads;
+- JSON;
+- Streamlit.
 
 ## Estrutura do projeto
 
 ```text
-tracker/
-  tracker.py
-
-peer/
-  peer.py
-  peer1.py
-  shared/
-    teste.txt
+.
+├── README.md
+├── .gitignore
+└── src/
+    ├── app_streamlit.py
+    ├── constants.py
+    ├── peer.py
+    ├── tracker.py
+    └── shared/
+        ├── teste.txt
 ```
+
+## Como funciona
+
+O funcionamento básico da aplicação ocorre em três etapas principais:
+
+1. Um peer registra um arquivo no tracker.
+2. Outro peer busca esse arquivo no tracker.
+3. O download é feito diretamente entre os peers.
+
+Fluxo simplificado:
+
+```text
+Peer 1 registra arquivo → Tracker salva a localização
+Peer 2 busca arquivo → Tracker retorna o Peer 1
+Peer 2 baixa o arquivo diretamente do Peer 1
+```
+
+A interface em Streamlit funciona como um painel de demonstração. Ela permite visualizar e controlar dois peers locais na mesma tela, facilitando a apresentação do funcionamento do protótipo.
+
+Mesmo com a interface, a lógica P2P se mantém: o tracker apenas localiza os arquivos e a transferência continua acontecendo diretamente entre os peers.
 
 ## Como executar
 
-### 1. Executar o tracker
+### 1. Instalar as dependências
 
-Abra um terminal na pasta principal do projeto e execute:
+O projeto utiliza Python e Streamlit. Para instalar o Streamlit, execute:
+
+```bash
+pip install streamlit
+```
+
+### 2. Executar o tracker
+
+Na raiz do projeto, execute:
 
 ```bash
 python src/tracker.py
 ```
 
-O tracker ficará aguardando conexões dos peers.
+O tracker ficará aguardando conexões dos peers na porta `5000`.
 
-### 2. Executar o primeiro peer
+### 3. Executar a interface Streamlit
 
-Abra outro terminal e execute:
-
-```bash
-python src/peer.py {PORTA}
-```
-Onde `{PORTA}` deve ser substituído pelo número desejado da porta que rodará o peer, que pode registrar arquivos no tracker e compartilhar arquivos com outros peers.
-
-### 3. Executar o segundo peer
-
-Abra mais um terminal e execute:
+Em outro terminal, ainda na raiz do projeto, execute:
 
 ```bash
-python src/peer.py {PORTA2}
+streamlit run src/app_streamlit.py
 ```
 
-Esse segundo peer pode buscar e baixar arquivos compartilhados pelo primeiro peer.
+```bash
+python -m streamlit run src/app_streamlit.py
+```
 
-## Exemplo de uso
+A interface será aberta no navegador.
 
-Com o tracker e os dois peers em execução:
+## Como testar pela interface
 
-1. No primeiro peer, escolha a opção de registrar arquivo.
-2. Digite o nome de um arquivo existente na pasta `peer/shared/`, por exemplo:
+Com o tracker rodando e a interface aberta:
+
+1. Clique em **Iniciar Peer 1**.
+2. Clique em **Iniciar Peer 2**.
+3. No campo do Peer 1, digite o nome de um arquivo existente em `src/shared/`.
+
+Exemplo:
 
 ```text
 teste.txt
 ```
 
-3. No segundo peer, escolha a opção de buscar arquivo.
-4. Digite o mesmo nome do arquivo:
+4. Clique em **Registrar no tracker**.
+5. No campo do Peer 2, digite o mesmo nome do arquivo.
+6. Clique em **Buscar**.
+7. Após o arquivo ser localizado, clique em **Baixar**.
+8. O arquivo baixado será salvo na pasta `downloads/`.
+
+## Pastas importantes
+
+### `src/shared/`
+
+Pasta onde ficam os arquivos que podem ser compartilhados pelos peers.
+
+Para registrar um arquivo no tracker, ele precisa existir primeiro nessa pasta.
+
+Exemplo:
 
 ```text
-teste.txt
+src/shared/teste.txt
 ```
 
-5. Após localizar o peer que possui o arquivo, escolha a opção de download.
-6. O arquivo será transferido diretamente de um peer para o outro.
+### `downloads/`
+
+Pasta onde são salvos os arquivos baixados.
+
+Essa pasta é gerada durante os testes e não precisa ser versionada no Git.
+- Arthur
+- Gabriel
+- Leandro
