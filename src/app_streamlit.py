@@ -1,5 +1,6 @@
 import os
 import threading
+import json
 import streamlit as st
 
 from constants import SHARED_FOLDER, DOWNLOAD_FOLDER, TRACKER_HOST, TRACKER_PORT
@@ -21,7 +22,7 @@ def init_state():
     defaults = {
         "peer_1_started": False,
         "peer_2_started": False,
-        "last_search": [],
+        "last_search": {},  # Suporta a árvore estruturada de chunks
         "logs": [],
         "last_downloaded_file": None,
     }
@@ -530,9 +531,9 @@ with peer_2_col:
                     else:
                         st.warning("Nenhum peer encontrado.")
 
-                    add_log(f"Peer 2 | busca por {peer_2_filename}: {result}")
+                    add_log(f"Peer 2 | busca por {peer_2_filename}: {list(result.keys())}")
                 else:
-                    st.session_state.last_search = []
+                    st.session_state.last_search = {}
                     st.error(result)
                     add_log(f"Peer 2 | falha na busca por {peer_2_filename}: {result}")
 
@@ -560,21 +561,23 @@ with results_col:
     st.markdown('<div class="section-title">Resultado da busca</div>', unsafe_allow_html=True)
 
     if st.session_state.last_search:
-        for peer in st.session_state.last_search:
-            st.markdown(
-                f"""
-                <div class="result-card">
-                    <div class="result-title">Peer encontrado</div>
-                    <div class="result-text">Endereço: {peer[0]} | Porta: {peer[1]}</div>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+        # last_search é um dicionário contendo {"0": [[ip, porta]], "1": [[ip, porta]]}
+        for chunk_id, sources in st.session_state.last_search.items():
+            for peer in sources:
+                st.markdown(
+                    f"""
+                    <div class="result-card">
+                        <div class="result-title">🧩 Parte {chunk_id} encontrada</div>
+                        <div class="result-text">Endereço: {peer[0]} | Porta: {peer[1]}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
     else:
         st.markdown(
             """
             <div class="empty-state">
-                Nenhuma busca realizada.
+                Nenhuma busca realizada ou nenhum peer encontrado.
             </div>
             """,
             unsafe_allow_html=True
