@@ -1,2 +1,6 @@
 downloads/
-/src/__pycache__
+peer_state/
+partial_chunks/
+src/__pycache__/
+__pycache__/
+*.pyc

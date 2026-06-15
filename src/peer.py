@@ -1,300 +1,651 @@
-from constants import TRACKER_HOST, TRACKER_PORT, SHARED_FOLDER, DOWNLOAD_FOLDER, PEER_HOST
-import threading
-import socket
-import errno
+import argparse
+import hashlib
 import json
-import sys
 import os
-import time  # Controla o tempo do loop do Heartbeat
+import random
+import socket
+import threading
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
-os.makedirs(SHARED_FOLDER, exist_ok=True)
-os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+from constants import (
+    TRACKER_HOST,
+    TRACKER_PORT,
+    PEER_LISTEN_HOST,
+    PEER_PUBLIC_HOST,
+    SHARED_FOLDER,
+    DOWNLOAD_FOLDER,
+    STATE_FOLDER,
+    PARTIAL_FOLDER,
+    CHUNK_SIZE,
+    HEARTBEAT_INTERVAL,
+)
+from protocol import send_json, read_json_line, request_json
 
-# TAMANHO PADRÃO DO CHUNK: 512 KB em bytes
-CHUNK_SIZE = 512 * 1024  
+
+# ----------------------------- utilitarios -----------------------------
+
+def ensure_dirs(*paths: str) -> None:
+    for path in paths:
+        os.makedirs(path, exist_ok=True)
 
 
-def start_heartbeat(peer_port):
-    """Loop em segundo plano que avisa o Tracker que este Peer continua online."""
-    time.sleep(1)
-    while True:
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: str) -> str:
+    hasher = hashlib.sha256()
+    with open(path, "rb") as fileobj:
+        for block in iter(lambda: fileobj.read(1024 * 1024), b""):
+            hasher.update(block)
+    return hasher.hexdigest()
+
+
+def chunk_count(file_size: int, chunk_size: int) -> int:
+    if file_size == 0:
+        return 1
+    return (file_size // chunk_size) + (1 if file_size % chunk_size else 0)
+
+
+def chunk_file_path(partial_dir: str, filename: str, file_hash: str, chunk_index: int) -> str:
+    safe_hash = hashlib.sha256(filename.encode("utf-8")).hexdigest()[:12]
+    return os.path.join(partial_dir, f"{safe_hash}_{file_hash[:12]}_{chunk_index}.chunk")
+
+
+def pretty_json(data: Any) -> str:
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+# ----------------------------- catalogo local -----------------------------
+
+class LocalCatalog:
+    """Estado local do peer.
+
+    O arquivo baixado nao grava que e seed. Quem grava o estado e este catalogo.
+    Ele diz quais arquivos/chunks este peer possui e de onde pode servi-los.
+    """
+
+    def __init__(self, state_dir: str, peer_id: str):
+        ensure_dirs(state_dir)
+        safe_peer = hashlib.sha256(peer_id.encode("utf-8")).hexdigest()[:12]
+        self.path = os.path.join(state_dir, f"catalog_{safe_peer}.json")
+        self.data: Dict[str, Any] = {"files": {}}
+        self.load()
+
+    def load(self) -> None:
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as fileobj:
+                    self.data = json.load(fileobj)
+            except Exception:
+                self.data = {"files": {}}
+        self.data.setdefault("files", {})
+
+    def save(self) -> None:
+        with open(self.path, "w", encoding="utf-8") as fileobj:
+            json.dump(self.data, fileobj, indent=2, ensure_ascii=False)
+
+    def get(self, filename: str) -> Optional[Dict[str, Any]]:
+        return self.data["files"].get(filename)
+
+    def all_files(self) -> Dict[str, Any]:
+        return self.data["files"]
+
+    def upsert_completed_file(
+        self,
+        *,
+        filename: str,
+        path: str,
+        file_size: int,
+        chunk_size: int,
+        total_chunks: int,
+        file_hash: str,
+        chunk_hashes: Dict[str, str],
+    ) -> None:
+        self.data["files"][filename] = {
+            "filename": filename,
+            "path": os.path.abspath(path),
+            "file_size": int(file_size),
+            "chunk_size": int(chunk_size),
+            "total_chunks": int(total_chunks),
+            "file_hash": file_hash,
+            "chunk_hashes": {str(k): v for k, v in chunk_hashes.items()},
+            "completed": True,
+            "chunks": {str(i): {"source": "completed_file"} for i in range(int(total_chunks))},
+        }
+        self.save()
+
+    def upsert_partial_chunk(
+        self,
+        *,
+        filename: str,
+        chunk_index: int,
+        chunk_path: str,
+        chunk_hash: str,
+        metadata: Dict[str, Any],
+    ) -> None:
+        filename = metadata["filename"]
+        entry = self.data["files"].setdefault(filename, {
+            "filename": filename,
+            "path": None,
+            "file_size": int(metadata["file_size"]),
+            "chunk_size": int(metadata["chunk_size"]),
+            "total_chunks": int(metadata["total_chunks"]),
+            "file_hash": metadata["file_hash"],
+            "chunk_hashes": metadata.get("chunk_hashes", {}),
+            "completed": False,
+            "chunks": {},
+        })
+
+        entry["file_size"] = int(metadata["file_size"])
+        entry["chunk_size"] = int(metadata["chunk_size"])
+        entry["total_chunks"] = int(metadata["total_chunks"])
+        entry["file_hash"] = metadata["file_hash"]
+        entry["chunk_hashes"] = metadata.get("chunk_hashes", entry.get("chunk_hashes", {}))
+        entry["chunks"][str(chunk_index)] = {
+            "source": "partial_chunk",
+            "path": os.path.abspath(chunk_path),
+            "hash": chunk_hash,
+        }
+        self.save()
+
+    def has_valid_chunk(self, filename: str, chunk_index: int) -> bool:
+        entry = self.get(filename)
+        if not entry:
+            return False
+        if entry.get("completed") and entry.get("path") and os.path.exists(entry["path"]):
+            return str(chunk_index) in entry.get("chunks", {})
+        chunk_info = entry.get("chunks", {}).get(str(chunk_index))
+        return bool(chunk_info and chunk_info.get("path") and os.path.exists(chunk_info["path"]))
+
+    def available_chunk_indices(self, filename: str) -> List[int]:
+        entry = self.get(filename)
+        if not entry:
+            return []
+        return sorted([int(i) for i in entry.get("chunks", {}).keys()])
+
+    def read_chunk(self, filename: str, chunk_index: int) -> Tuple[bytes, Dict[str, Any]]:
+        entry = self.get(filename)
+        if not entry:
+            raise FileNotFoundError("Arquivo nao existe no catalogo local deste peer.")
+
+        chunk_index_str = str(chunk_index)
+        if chunk_index_str not in entry.get("chunks", {}):
+            raise FileNotFoundError("Este peer nao possui o chunk solicitado.")
+
+        chunk_size = int(entry["chunk_size"])
+        expected_size = min(chunk_size, int(entry["file_size"]) - chunk_index * chunk_size)
+        if expected_size < 0:
+            raise ValueError("Indice de chunk fora do tamanho do arquivo.")
+
+        if entry.get("completed"):
+            path = entry.get("path")
+            if not path or not os.path.exists(path):
+                raise FileNotFoundError("Arquivo completo nao encontrado no disco.")
+            with open(path, "rb") as fileobj:
+                fileobj.seek(chunk_index * chunk_size)
+                data = fileobj.read(expected_size)
+        else:
+            chunk_path = entry["chunks"][chunk_index_str].get("path")
+            if not chunk_path or not os.path.exists(chunk_path):
+                raise FileNotFoundError("Chunk parcial nao encontrado no disco.")
+            with open(chunk_path, "rb") as fileobj:
+                data = fileobj.read()
+
+        return data, entry
+
+
+# ----------------------------- peer -----------------------------
+
+class PeerNode:
+    def __init__(
+        self,
+        *,
+        peer_id: str,
+        listen_host: str,
+        public_host: str,
+        peer_port: int,
+        tracker_host: str,
+        tracker_port: int,
+        shared_dir: str,
+        downloads_dir: str,
+        state_dir: str,
+        partial_dir: str,
+        chunk_size: int,
+    ):
+        self.peer_id = peer_id
+        self.listen_host = listen_host
+        self.public_host = public_host
+        self.peer_port = int(peer_port)
+        self.tracker_host = tracker_host
+        self.tracker_port = int(tracker_port)
+        self.shared_dir = shared_dir
+        self.downloads_dir = downloads_dir
+        self.state_dir = state_dir
+        self.partial_dir = partial_dir
+        self.chunk_size = int(chunk_size)
+        self.catalog = LocalCatalog(state_dir, peer_id)
+        self.stop_event = threading.Event()
+
+        ensure_dirs(self.shared_dir, self.downloads_dir, self.state_dir, self.partial_dir)
+
+    # ------------------------- comunicacao com tracker -------------------------
+
+    def tracker_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return request_json(self.tracker_host, self.tracker_port, payload)
+
+    def heartbeat_loop(self) -> None:
+        time.sleep(1)
+        while not self.stop_event.is_set():
+            try:
+                self.tracker_request({
+                    "action": "heartbeat",
+                    "peer_id": self.peer_id,
+                    "peer_host": self.public_host,
+                    "peer_port": self.peer_port,
+                })
+            except Exception as error:
+                print(f"[HEARTBEAT] Tracker indisponivel: {error}")
+            time.sleep(HEARTBEAT_INTERVAL)
+
+    def register_chunk(self, filename: str, chunk_index: int, entry: Dict[str, Any]) -> Dict[str, Any]:
+        chunk_hash = entry["chunk_hashes"][str(chunk_index)]
+        request = {
+            "action": "register_chunk",
+            "filename": filename,
+            "chunk_index": int(chunk_index),
+            "chunk_hash": chunk_hash,
+            "file_hash": entry["file_hash"],
+            "file_size": int(entry["file_size"]),
+            "chunk_size": int(entry["chunk_size"]),
+            "total_chunks": int(entry["total_chunks"]),
+            "peer_id": self.peer_id,
+            "peer_host": self.public_host,
+            "peer_port": self.peer_port,
+        }
+        return self.tracker_request(request)
+
+    def announce_known_chunks(self, filename: Optional[str] = None) -> None:
+        files = self.catalog.all_files()
+        targets = [filename] if filename else list(files.keys())
+
+        for name in targets:
+            entry = files.get(name)
+            if not entry:
+                continue
+
+            for chunk_index in self.catalog.available_chunk_indices(name):
+                try:
+                    response = self.register_chunk(name, chunk_index, entry)
+                    if response.get("status") != "success":
+                        print(f"[ANUNCIO] Falha ao anunciar {name} chunk {chunk_index}: {response.get('message')}")
+                except Exception as error:
+                    print(f"[ANUNCIO] Tracker indisponivel ao anunciar {name}: {error}")
+                    return
+
+    def search_file(self, filename: str) -> Tuple[bool, Any]:
         try:
-            client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            client.connect((TRACKER_HOST, TRACKER_PORT))
-
-            request = {
-                "action": "heartbeat",
-                "peer_ip": PEER_HOST,
-                "peer_port": peer_port
-            }
-
-            client.send(json.dumps(request).encode())
-            client.recv(1024)
-            client.close()
+            response = self.tracker_request({"action": "search", "filename": filename})
+            if response.get("status") != "success":
+                return False, response.get("message", "Erro ao buscar arquivo.")
+            if not response.get("found"):
+                return False, "Arquivo nao encontrado no tracker."
+            return True, response["file"]
+        except ConnectionRefusedError:
+            return False, "Nao foi possivel conectar ao tracker."
         except Exception as error:
-            print(f"\n[HEARTBEAT ERRO] Tracker indisponível: {error}")
-        
-        time.sleep(5)
+            return False, f"Erro ao buscar arquivo: {error}"
 
+    def tracker_status(self) -> Tuple[bool, Any]:
+        try:
+            response = self.tracker_request({"action": "status"})
+            return response.get("status") == "success", response
+        except Exception as error:
+            return False, f"Erro ao consultar tracker: {error}"
 
-def upload_server(peer_port):
-    try:
+    # ------------------------- servidor de upload -------------------------
+
+    def start(self) -> None:
+        threading.Thread(target=self.upload_server, daemon=True).start()
+        threading.Thread(target=self.heartbeat_loop, daemon=True).start()
+        self.announce_known_chunks()
+
+    def upload_server(self) -> None:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.bind((PEER_HOST, peer_port))
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((self.listen_host, self.peer_port))
         server.listen()
-    except OSError as e:
-        if e.errno == errno.EADDRINUSE:
-            print("A porta selecionada já está em uso")
-            return
-        print(f"Erro ao iniciar servidor do peer: {e}")
-        return
 
-    print(f"[PEER ONLINE] Porta {peer_port}")
+        print(f"[PEER ONLINE] {self.peer_id} escutando em {self.listen_host}:{self.peer_port}")
+        print(f"[PEER ONLINE] Anunciando ao tracker como {self.public_host}:{self.peer_port}")
 
-    threading.Thread(
-        target=start_heartbeat,
-        args=(peer_port,),
-        daemon=True
-    ).start()
+        while not self.stop_event.is_set():
+            try:
+                conn, addr = server.accept()
+                threading.Thread(target=self.handle_peer_connection, args=(conn, addr), daemon=True).start()
+            except OSError:
+                break
 
-    while True:
-        conn, addr = server.accept()
-        thread = threading.Thread(
-            target=send_file,
-            args=(conn,),
-            daemon=True
-        )
-        thread.start()
+    def handle_peer_connection(self, conn: socket.socket, addr: Tuple[str, int]) -> None:
+        try:
+            with conn.makefile("rb") as fileobj:
+                request = read_json_line(fileobj)
 
+            action = request.get("action")
+            if action != "get_chunk":
+                send_json(conn, {"status": "error", "message": "Acao invalida para peer."})
+                return
 
-# --- MODIFICADO: ENVIA APENAS O CHUNK SOLICITADO ---
-def send_file(conn):
-    try:
-        data = conn.recv(1024).decode()
-        if not data:
-            conn.close()
-            return
+            filename = request["filename"]
+            chunk_index = int(request["chunk_index"])
+            data, entry = self.catalog.read_chunk(filename, chunk_index)
+            expected_hash = entry["chunk_hashes"].get(str(chunk_index))
+            actual_hash = sha256_bytes(data)
 
-        # Espera um pedido em JSON contendo o filename e o chunk_index
-        request = json.loads(data)
-        filename = request["filename"]
-        chunk_index = int(request["chunk_index"])
+            if expected_hash and actual_hash != expected_hash:
+                send_json(conn, {"status": "error", "message": "Chunk local falhou na validacao de hash."})
+                return
 
-        filepath = os.path.join(SHARED_FOLDER, filename)
-
-        if os.path.exists(filepath):
-            with open(filepath, "rb") as file:
-                # Move o ponteiro do arquivo para o início do bloco pedido
-                file.seek(chunk_index * CHUNK_SIZE)
-                
-                # Lê exatamente a quantidade estipulada para um pedaço
-                bytes_to_send = file.read(CHUNK_SIZE)
-                
-                # Descarrega o pedaço na conexão TCP
-                conn.sendall(bytes_to_send)
-    except Exception as e:
-        print(f"[UPLOAD ERRO] Falha ao enviar chunk: {e}")
-        
-    conn.close()
-
-
-# --- MODIFICADO: QUEBRA O ARQUIVO EM PARTES E REGISTRA CADA UMA DELAS NO TRACKER ---
-def register_file(filename, peer_port):
-    filepath = os.path.join(SHARED_FOLDER, filename)
-
-    if not os.path.exists(filepath):
-        message = f"O arquivo '{filename}' não existe na pasta shared."
-        print(message)
-        return False, message
-
-    try:
-        file_size = os.path.getsize(filepath)
-        
-        # Calcula a quantidade de partes (Se sobrar resto na divisão, ganha mais um chunk)
-        total_chunks = (file_size // CHUNK_SIZE) + (1 if file_size % CHUNK_SIZE > 0 else 0)
-        if total_chunks == 0: 
-            total_chunks = 1
-
-        print(f"[REGISTRO] Arquivo de {file_size} bytes detectado. Dividindo em {total_chunks} chunk(s)...")
-
-        # Cadastra cada pedaço sequencialmente no catálogo do Tracker
-        for chunk_index in range(total_chunks):
-            client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            client.connect((TRACKER_HOST, TRACKER_PORT))
-
-            request = {
-                "action": "register",
+            send_json(conn, {
+                "status": "success",
                 "filename": filename,
                 "chunk_index": chunk_index,
-                "peer_ip": PEER_HOST,
-                "peer_port": peer_port
-            }
+                "size": len(data),
+                "chunk_hash": actual_hash,
+            })
+            conn.sendall(data)
+            print(f"[UPLOAD] Enviei {filename} chunk {chunk_index} para {addr[0]}:{addr[1]}")
+        except Exception as error:
+            try:
+                send_json(conn, {"status": "error", "message": str(error)})
+            except Exception:
+                pass
+        finally:
+            conn.close()
 
-            client.send(json.dumps(request).encode())
-            client.recv(4096)  # Aguarda a resposta de sucesso do chunk
-            client.close()
+    # ------------------------- compartilhamento local -------------------------
 
-        message = f"Sucesso: Todos os {total_chunks} chunks de '{filename}' foram registrados."
-        return True, message
+    def build_file_metadata(self, path: str) -> Dict[str, Any]:
+        file_size = os.path.getsize(path)
+        total_chunks = chunk_count(file_size, self.chunk_size)
+        chunk_hashes: Dict[str, str] = {}
 
-    except ConnectionRefusedError:
-        message = "Não foi possível conectar ao tracker. Verifique se ele está rodando."
-        print(message)
-        return False, message
-    except Exception as error:
-        message = f"Erro ao registrar arquivo: {error}"
-        print(message)
-        return False, message
+        with open(path, "rb") as fileobj:
+            for index in range(total_chunks):
+                data = fileobj.read(self.chunk_size)
+                chunk_hashes[str(index)] = sha256_bytes(data)
 
-
-# --- MODIFICADO: SOLICITA A LISTA DE CHUNKS AO TRACKER ---
-def search_file(filename):
-    try:
-        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        client.connect((TRACKER_HOST, TRACKER_PORT))
-
-        request = {
-            "action": "search",
-            "filename": filename
+        return {
+            "filename": os.path.basename(path),
+            "path": os.path.abspath(path),
+            "file_size": file_size,
+            "chunk_size": self.chunk_size,
+            "total_chunks": total_chunks,
+            "file_hash": sha256_file(path),
+            "chunk_hashes": chunk_hashes,
         }
 
-        client.send(json.dumps(request).encode())
-        response = json.loads(client.recv(4096).decode())
-        client.close()
+    def share_file(self, user_path: str) -> Tuple[bool, str]:
+        path = user_path
+        if not os.path.isabs(path):
+            path = os.path.join(self.shared_dir, user_path)
 
-        # O Tracker atualizado agora devolve a chave "chunks" contendo o mapeamento das partes
-        chunks = response.get("chunks", {})
-        return True, chunks
+        if not os.path.exists(path) or not os.path.isfile(path):
+            return False, f"Arquivo nao encontrado: {path}"
 
-    except ConnectionRefusedError:
-        message = "Não foi possível conectar ao tracker. Verifique se ele está rodando."
-        print(message)
-        return False, message
-    except Exception as error:
-        message = f"Erro ao buscar arquivo: {error}"
-        print(message)
-        return False, message
+        metadata = self.build_file_metadata(path)
+        filename = metadata["filename"]
+
+        self.catalog.upsert_completed_file(**metadata)
+        entry = self.catalog.get(filename)
+        assert entry is not None
+
+        print(f"[SHARE] '{filename}' possui {entry['total_chunks']} chunk(s). Anunciando ao tracker...")
+
+        for index in range(int(entry["total_chunks"])):
+            response = self.register_chunk(filename, index, entry)
+            if response.get("status") != "success":
+                return False, response.get("message", "Erro ao registrar chunk.")
+
+        return True, f"'{filename}' compartilhado. Este peer agora e seed desse arquivo."
+
+    # ------------------------- download -------------------------
+
+    def choose_peer_for_chunk(self, peers: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        candidates = [p for p in peers if p.get("peer_id") != self.peer_id]
+        if not candidates:
+            return None
+        return random.choice(candidates)
+
+    def request_chunk(self, peer: Dict[str, Any], filename: str, chunk_index: int) -> bytes:
+        host = peer["host"]
+        port = int(peer["port"])
+        with socket.create_connection((host, port), timeout=20) as sock:
+            send_json(sock, {"action": "get_chunk", "filename": filename, "chunk_index": chunk_index})
+            with sock.makefile("rb") as fileobj:
+                header = read_json_line(fileobj)
+                if header.get("status") != "success":
+                    raise RuntimeError(header.get("message", "Peer nao enviou o chunk."))
+                size = int(header["size"])
+                data = fileobj.read(size)
+                if len(data) != size:
+                    raise RuntimeError("Chunk recebido incompleto.")
+                return data
+
+    def save_partial_chunk(self, metadata: Dict[str, Any], chunk_index: int, data: bytes) -> str:
+        path = chunk_file_path(self.partial_dir, metadata["filename"], metadata["file_hash"], chunk_index)
+        with open(path, "wb") as fileobj:
+            fileobj.write(data)
+        return path
+
+    def assemble_completed_file(self, metadata: Dict[str, Any]) -> str:
+        filename = metadata["filename"]
+        temp_path = os.path.join(self.downloads_dir, filename + ".part")
+        final_path = os.path.join(self.downloads_dir, filename)
+
+        with open(temp_path, "wb") as output:
+            for index in range(int(metadata["total_chunks"])):
+                data, _ = self.catalog.read_chunk(filename, index)
+                output.write(data)
+
+        final_hash = sha256_file(temp_path)
+        if final_hash != metadata["file_hash"]:
+            raise RuntimeError("Hash final do arquivo nao confere. Download descartado.")
+
+        os.replace(temp_path, final_path)
+        return final_path
+
+    def download_file(self, filename: str) -> Tuple[bool, str]:
+        success, result = self.search_file(filename)
+        if not success:
+            return False, result
+
+        metadata = result
+        total_chunks = int(metadata["total_chunks"])
+        chunk_hashes = metadata.get("chunk_hashes", {})
+        chunks = metadata.get("chunks", {})
+
+        if not chunks:
+            return False, "Arquivo encontrado, mas nao ha chunks disponiveis. Sem fonte ativa."
+
+        print(f"[DOWNLOAD] Arquivo '{filename}': {total_chunks} chunk(s). Seeds: {metadata.get('seed_count', 0)}")
+
+        for index in range(total_chunks):
+            if self.catalog.has_valid_chunk(filename, index):
+                print(f"[DOWNLOAD] Chunk {index} ja existe localmente. Pulando.")
+                continue
+
+            peers = chunks.get(str(index), [])
+            peer = self.choose_peer_for_chunk(peers)
+            if not peer:
+                return False, f"Nao ha outro peer disponivel para o chunk {index}."
+
+            print(f"[DOWNLOAD] Baixando chunk {index} de {peer['peer_id']} ({peer['host']}:{peer['port']})...")
+            try:
+                data = self.request_chunk(peer, filename, index)
+            except Exception as error:
+                return False, f"Falha ao baixar chunk {index}: {error}"
+
+            expected_hash = chunk_hashes.get(str(index))
+            actual_hash = sha256_bytes(data)
+            if expected_hash and actual_hash != expected_hash:
+                return False, f"Chunk {index} veio corrompido. Hash nao confere."
+
+            chunk_path = self.save_partial_chunk(metadata, index, data)
+            self.catalog.upsert_partial_chunk(
+                filename=filename,
+                chunk_index=index,
+                chunk_path=chunk_path,
+                chunk_hash=actual_hash,
+                metadata=metadata,
+            )
+
+            # Aqui o leecher ja ajuda a swarm: assim que tem um chunk valido,
+            # anuncia esse chunk ao tracker e pode servir esse pedaco para outros.
+            entry = self.catalog.get(filename)
+            assert entry is not None
+            response = self.register_chunk(filename, index, entry)
+            if response.get("status") == "success":
+                print(f"[LEECHER] Chunk {index} anunciado. Este peer ja pode enviar esse pedaco.")
+            else:
+                print(f"[LEECHER] Nao consegui anunciar chunk {index}: {response.get('message')}")
+
+        # Se chegou aqui, todos os chunks existem localmente.
+        try:
+            final_path = self.assemble_completed_file(metadata)
+        except Exception as error:
+            return False, f"Erro ao montar arquivo final: {error}"
+
+        self.catalog.upsert_completed_file(
+            filename=filename,
+            path=final_path,
+            file_size=int(metadata["file_size"]),
+            chunk_size=int(metadata["chunk_size"]),
+            total_chunks=total_chunks,
+            file_hash=metadata["file_hash"],
+            chunk_hashes=chunk_hashes,
+        )
+
+        # Reanuncia todos os chunks. Agora o tracker vai contar este peer como seed.
+        self.announce_known_chunks(filename)
+        return True, f"Download finalizado em '{final_path}'. Este peer agora e seed de '{filename}'."
+
+    # ------------------------- exibicao CLI -------------------------
+
+    def show_local_catalog(self) -> None:
+        files = self.catalog.all_files()
+        if not files:
+            print("Catalogo local vazio.")
+            return
+
+        for filename, entry in files.items():
+            status = "SEED" if entry.get("completed") else "LEECHER/PARCIAL"
+            chunks = self.catalog.available_chunk_indices(filename)
+            print(f"\nArquivo: {filename}")
+            print(f"Status local: {status}")
+            print(f"Chunks locais: {chunks} ({len(chunks)}/{entry.get('total_chunks')})")
+            print(f"Hash: {entry.get('file_hash')}")
+            print(f"Caminho: {entry.get('path')}")
+
+    def show_tracker_status(self) -> None:
+        success, status = self.tracker_status()
+        if not success:
+            print(status)
+            return
+        print(pretty_json(status))
 
 
-# --- MODIFICADO: BAIXA CADA PEDAÇO INDIVIDUALMENTE E MONTA O ARQUIVO FINAL ---
-def download_file(filename):
-    success, result = search_file(filename)
+# ----------------------------- CLI -----------------------------
 
-    if not success:
-        return False, result
-
-    chunks_disponiveis = result
-
-    if not chunks_disponiveis:
-        message = "Arquivo não encontrado ou sem fontes ativas na rede."
-        print(message)
-        return False, message
-
-    filepath = os.path.join(DOWNLOAD_FOLDER, filename)
-    
-    # Organiza os índices numéricos para garantir que vamos montar na sequência correta (0, 1, 2...)
-    indices_ordenados = sorted([int(k) for k in chunks_disponiveis.keys()])
-
-    print(f"[DOWNLOAD] Baixando {len(indices_ordenados)} partes de '{filename}'...")
-
-    try:
-        # Abre o arquivo de destino final em modo de escrita binária ("wb")
-        with open(filepath, "wb") as file_destino:
-            for chunk_index in indices_ordenados:
-                # Recupera os peers que possuem o pedaço atual
-                peers_do_chunk = chunks_disponiveis[str(chunk_index)]
-                if not peers_do_chunk:
-                    return False, f"Erro: A parte {chunk_index} perdeu as fontes durante a transmissão."
-
-                # Escolhe o primeiro peer mapeado para fornecer o pedaço
-                peer_ip, peer_port = peers_do_chunk[0]
-                
-                # Conecta diretamente no peer doador
-                peer_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                peer_sock.connect((peer_ip, int(peer_port)))
-
-                # Envia a requisição contendo o dicionário com o chunk desejado
-                pedido = {"filename": filename, "chunk_index": chunk_index}
-                peer_sock.send(json.dumps(pedido).encode())
-
-                # Loop de recepção robusto para extrair o chunk completo
-                bytes_do_chunk = b""
-                while len(bytes_do_chunk) < CHUNK_SIZE:
-                    dados = peer_sock.recv(4096)
-                    if not dados:
-                        break
-                    bytes_do_chunk += dados
-
-                # Grava o bloco recebido direto no arquivo final
-                file_destino.write(bytes_do_chunk)
-                peer_sock.close()
-                print(f"[DOWNLOAD] Parte {chunk_index} unida com sucesso.")
-
-        if os.path.getsize(filepath) == 0:
-            message = "Download finalizado, mas o arquivo veio vazio."
-            print(message)
-            return False, message
-
-        message = f"[DOWNLOAD FINALIZADO] '{filename}' reconstruído perfeitamente!"
-        print(message)
-        return True, message
-
-    except Exception as error:
-        message = f"Erro ao baixar arquivo: {error}"
-        print(message)
-        return False, message
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Peer P2P por linha de comando.")
+    parser.add_argument("--peer-id", default=None, help="Identificador do peer. Padrao: <public-host>:<port>")
+    parser.add_argument("--listen-host", default=PEER_LISTEN_HOST, help="Host local para escutar conexoes. Use 0.0.0.0 em rede local.")
+    parser.add_argument("--public-host", default=PEER_PUBLIC_HOST, help="IP/host anunciado ao tracker. Em dois PCs, use o IP real da maquina.")
+    parser.add_argument("--port", type=int, required=True, help="Porta TCP do servidor de upload deste peer.")
+    parser.add_argument("--tracker-host", default=TRACKER_HOST, help="IP/host do tracker.")
+    parser.add_argument("--tracker-port", type=int, default=TRACKER_PORT, help="Porta do tracker.")
+    parser.add_argument("--shared-dir", default=SHARED_FOLDER, help="Pasta com arquivos locais para compartilhar.")
+    parser.add_argument("--downloads-dir", default=DOWNLOAD_FOLDER, help="Pasta onde downloads completos serao salvos.")
+    parser.add_argument("--state-dir", default=STATE_FOLDER, help="Pasta do catalogo local do peer.")
+    parser.add_argument("--partial-dir", default=PARTIAL_FOLDER, help="Pasta para chunks parciais.")
+    parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE, help="Tamanho dos chunks em bytes.")
+    return parser.parse_args()
 
 
-def cli_main():
-    try:
-        peer_port = int(sys.argv[1])
-    except IndexError:
-        print("Uso correto: python peer.py <porta>")
-        return
-    except ValueError:
-        print("Parâmetro informado é inválido. Informe uma porta numérica.")
-        return
-
-    threading.Thread(
-        target=upload_server,
-        args=(peer_port,),
-        daemon=True
-    ).start()
-
+def menu_loop(peer: PeerNode) -> None:
     while True:
-        print("\n1 - Registrar arquivo")
-        print("2 - Buscar arquivo")
-        print("3 - Download arquivo")
-        print("4 - Sair")
+        print("\n================ PEER P2P ================")
+        print(f"Peer: {peer.peer_id} | upload: {peer.public_host}:{peer.peer_port}")
+        print("1 - Compartilhar arquivo local (vira seed)")
+        print("2 - Buscar arquivo no tracker")
+        print("3 - Baixar arquivo")
+        print("4 - Ver catalogo local")
+        print("5 - Ver status do tracker")
+        print("6 - Reanunciar meus chunks/arquivos ao tracker")
+        print("0 - Sair")
 
-        option = input("Escolha: ")
+        option = input("Escolha: ").strip()
 
         if option == "1":
-            filename = input("Nome do arquivo: ")
-            success, message = register_file(filename, peer_port)
+            path = input("Nome do arquivo em shared/ ou caminho completo: ").strip()
+            success, message = peer.share_file(path)
             print(message)
 
         elif option == "2":
-            filename = input("Nome do arquivo: ")
-            success, result = search_file(filename)
-
+            filename = input("Nome do arquivo: ").strip()
+            success, result = peer.search_file(filename)
             if success:
-                print("Chunks e fontes mapeadas encontrados:")
-                print(json.dumps(result, indent=2))
+                print(pretty_json(result))
             else:
                 print(result)
 
         elif option == "3":
-            filename = input("Nome do arquivo: ")
-            success, message = download_file(filename)
+            filename = input("Nome do arquivo: ").strip()
+            success, message = peer.download_file(filename)
             print(message)
 
         elif option == "4":
+            peer.show_local_catalog()
+
+        elif option == "5":
+            peer.show_tracker_status()
+
+        elif option == "6":
+            peer.announce_known_chunks()
+            print("Anuncio finalizado.")
+
+        elif option == "0":
             print("Encerrando peer...")
+            peer.stop_event.set()
             break
+
         else:
-            print("Opção inválida.")
+            print("Opcao invalida.")
+
+
+def main() -> None:
+    args = parse_args()
+    peer_id = args.peer_id or f"{args.public_host}:{args.port}"
+
+    peer = PeerNode(
+        peer_id=peer_id,
+        listen_host=args.listen_host,
+        public_host=args.public_host,
+        peer_port=args.port,
+        tracker_host=args.tracker_host,
+        tracker_port=args.tracker_port,
+        shared_dir=args.shared_dir,
+        downloads_dir=args.downloads_dir,
+        state_dir=args.state_dir,
+        partial_dir=args.partial_dir,
+        chunk_size=args.chunk_size,
+    )
+
+    peer.start()
+    menu_loop(peer)
 
 
 if __name__ == "__main__":
-    cli_main()
+    main()

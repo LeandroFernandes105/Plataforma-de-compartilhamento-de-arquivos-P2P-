@@ -1,134 +1,142 @@
 # Plataforma de Compartilhamento de Arquivos P2P
 
-Este projeto é um protótipo de uma plataforma de compartilhamento de arquivos baseada no modelo Peer-to-Peer (P2P), desenvolvido em Python.
+Projeto em Python para simular uma rede P2P.
 
-A aplicação permite simular uma rede P2P simples, na qual um peer registra um arquivo em um tracker, outro peer consulta esse tracker para localizar o arquivo e, em seguida, realiza o download diretamente do peer que possui o conteúdo.
+## Conceitos implementados
 
-O tracker não armazena os arquivos. Ele atua apenas como um catálogo, registrando quais peers possuem determinados arquivos. A transferência dos arquivos ocorre diretamente entre os peers.
+- Tracker como indice da rede;
+- Peer com servidor de upload;
+- Arquivo dividido em chunks;
+- Hash do arquivo completo;
+- Hash individual de cada chunk;
+- Seed explicito: peer com 100% dos chunks;
+- Leecher/parcial: peer com alguns chunks;
+- Peer que baixa um chunk ja pode anunciar e enviar esse chunk;
+- Peer que termina o download valida o arquivo e vira seed automaticamente;
+- Heartbeat para remover peers offline do tracker;
+- Catalogo local persistente em `peer_state/`.
 
-## Funcionalidades do protótipo
-
-- Registro de arquivos no tracker;
-- Busca de arquivos disponíveis na rede;
-- Download direto entre peers;
-- Simulação de dois peers locais;
-- Interface de demonstração em Streamlit;
-- Comunicação entre processos usando sockets TCP;
-- Uso de threads para manter os peers disponíveis para conexões.
-
-## Tecnologias utilizadas
-
-- Python;
-- Sockets TCP;
-- Threads;
-- JSON;
-- Streamlit.
-
-## Estrutura do projeto
+## Estrutura
 
 ```text
 .
 ├── README.md
-├── .gitignore
 └── src/
-    ├── app_streamlit.py
     ├── constants.py
     ├── peer.py
+    ├── protocol.py
     ├── tracker.py
     └── shared/
-        ├── teste.txt
 ```
 
-## Como funciona
-
-O funcionamento básico da aplicação ocorre em três etapas principais:
-
-1. Um peer registra um arquivo no tracker.
-2. Outro peer busca esse arquivo no tracker.
-3. O download é feito diretamente entre os peers.
-
-Fluxo simplificado:
+Pastas criadas durante a execucao:
 
 ```text
-Peer 1 registra arquivo → Tracker salva a localização
-Peer 2 busca arquivo → Tracker retorna o Peer 1
-Peer 2 baixa o arquivo diretamente do Peer 1
+downloads/       arquivos completos baixados
+partial_chunks/  chunks parciais enquanto baixa
+peer_state/      catalogo local do peer
 ```
 
-A interface em Streamlit funciona como um painel de demonstração. Ela permite visualizar e controlar dois peers locais na mesma tela, facilitando a apresentação do funcionamento do protótipo.
+## Como rodar localmente em uma maquina
 
-Mesmo com a interface, a lógica P2P se mantém: o tracker apenas localiza os arquivos e a transferência continua acontecendo diretamente entre os peers.
-
-## Como executar
-
-### 1. Instalar as dependências
-
-O projeto utiliza Python e Streamlit. Para instalar o Streamlit, execute:
+Terminal 1:
 
 ```bash
-pip install streamlit
+python src/tracker.py --host 127.0.0.1 --port 5000
 ```
 
-### 2. Executar o tracker
-
-Na raiz do projeto, execute:
+Terminal 2, Peer A:
 
 ```bash
-python src/tracker.py
+python src/peer.py --peer-id peer-a --listen-host 127.0.0.1 --public-host 127.0.0.1 --port 6001 --tracker-host 127.0.0.1 --tracker-port 5000
 ```
 
-O tracker ficará aguardando conexões dos peers na porta `5000`.
-
-### 3. Executar a interface Streamlit
-
-Em outro terminal, ainda na raiz do projeto, execute:
+Terminal 3, Peer B:
 
 ```bash
-streamlit run src/app_streamlit.py
+python src/peer.py --peer-id peer-b --listen-host 127.0.0.1 --public-host 127.0.0.1 --port 6002 --tracker-host 127.0.0.1 --tracker-port 5000
 ```
 
-```bash
-python -m streamlit run src/app_streamlit.py
+No Peer A:
+
+```text
+1 - Compartilhar arquivo local (vira seed)
 ```
 
-A interface será aberta no navegador.
-
-## Como testar pela interface
-
-Com o tracker rodando e a interface aberta:
-
-1. Clique em **Iniciar Peer 1**.
-2. Clique em **Iniciar Peer 2**.
-3. No campo do Peer 1, digite o nome de um arquivo existente em `src/shared/`.
-
-Exemplo:
+Digite um arquivo que exista em `src/shared/`, por exemplo:
 
 ```text
 teste.txt
 ```
 
-4. Clique em **Registrar no tracker**.
-5. No campo do Peer 2, digite o mesmo nome do arquivo.
-6. Clique em **Buscar**.
-7. Após o arquivo ser localizado, clique em **Baixar**.
-8. O arquivo baixado será salvo na pasta `downloads/`.
+No Peer B:
 
-## Pastas importantes
+```text
+2 - Buscar arquivo no tracker
+3 - Baixar arquivo
+5 - Ver status do tracker
+```
 
-### `src/shared/`
+Depois do download, o tracker deve mostrar `seed_count: 2` para o arquivo baixado.
 
-Pasta onde ficam os arquivos que podem ser compartilhados pelos peers.
-
-Para registrar um arquivo no tracker, ele precisa existir primeiro nessa pasta.
+## Como rodar em dois computadores
 
 Exemplo:
 
 ```text
-src/shared/teste.txt
+PC 1 = 192.168.0.10
+PC 2 = 192.168.0.20
 ```
 
-### `downloads/`
+No PC 1, tracker:
 
-Pasta onde são salvos os arquivos baixados.
+```bash
+python src/tracker.py --host 0.0.0.0 --port 5000
+```
 
-Essa pasta é gerada durante os testes e não precisa ser versionada no Git.
+No PC 1, Peer A:
+
+```bash
+python src/peer.py --peer-id peer-a --listen-host 0.0.0.0 --public-host 192.168.0.10 --port 6001 --tracker-host 192.168.0.10 --tracker-port 5000
+```
+
+No PC 2, Peer B:
+
+```bash
+python src/peer.py --peer-id peer-b --listen-host 0.0.0.0 --public-host 192.168.0.20 --port 6002 --tracker-host 192.168.0.10 --tracker-port 5000
+```
+
+Importante: entre computadores diferentes, nao use `127.0.0.1` como `--public-host`. Use o IP real da maquina na rede local.
+
+## Fluxo da logica de seed
+
+1. O Peer A compartilha um arquivo.
+2. O arquivo e dividido em chunks.
+3. O Peer A registra todos os chunks no tracker.
+4. Como tem 100% dos chunks, o Peer A e seed.
+5. O Peer B busca o arquivo no tracker.
+6. O Peer B baixa os chunks diretamente do Peer A.
+7. A cada chunk valido, o Peer B anuncia esse chunk ao tracker e ja pode enviar esse pedaco.
+8. Ao completar todos os chunks, o Peer B monta o arquivo final.
+9. O Peer B valida o hash final.
+10. O Peer B registra todos os chunks e vira seed.
+
+## Menu do peer
+
+```text
+1 - Compartilhar arquivo local (vira seed)
+2 - Buscar arquivo no tracker
+3 - Baixar arquivo
+4 - Ver catalogo local
+5 - Ver status do tracker
+6 - Reanunciar meus chunks/arquivos ao tracker
+0 - Sair
+```
+
+## Observacoes
+
+- O tracker guarda metadados e fontes, nao guarda arquivos.
+- O arquivo em si nao grava que e seed.
+- O catalogo local do peer grava quais arquivos/chunks aquele peer possui.
+- O tracker calcula quem e seed verificando se um peer possui todos os chunks de um arquivo.
+- Se um peer sair da rede e parar de enviar heartbeat, o tracker remove os chunks dele apos o timeout.
