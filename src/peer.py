@@ -482,21 +482,32 @@ class PeerNode:
             print(f"[DOWNLOAD] Chunk {index} ja existe localmente. Pulando.")
             return index, True, ""
 
-        # Escolhe um peer da swarm que possui este chunk (excluindo a si mesmo)
+    # Tenta baixar o chunk de peers diferentes em caso de corrupcao ou falha.
+    # quantas tentativas serao feitas antes de desistir:
+    MAX_RETRIES = 3
+
+    for attempt in range(1, MAX_RETRIES + 1):
         peers = chunks.get(str(index), [])
         peer = self.choose_peer_for_chunk(peers)
         if not peer:
             return index, False, f"Nao ha outro peer disponivel para o chunk {index}."
 
-        print(f"[DOWNLOAD] Baixando chunk {index} de {peer['peer_id']} ({peer['host']}:{peer['port']})...")
+        print(f"[DOWNLOAD] Chunk {index} — tentativa {attempt}/{MAX_RETRIES} via {peer['peer_id']} ({peer['host']}:{peer['port']})...")
         try:
             data = self.request_chunk(peer, filename, index)
         except Exception as error:
-            return index, False, f"Falha ao baixar chunk {index}: {error}"
+            print(f"[RETRY] Chunk {index} falhou na tentativa {attempt}: {error}")
+            continue
+
         expected_hash = chunk_hashes.get(str(index))
         actual_hash = sha256_bytes(data)
         if expected_hash and actual_hash != expected_hash:
-            return index, False, f"Chunk {index} veio corrompido. Hash nao confere."
+            print(f"[RETRY] Chunk {index} corrompido na tentativa {attempt}. Tentando outro peer...")
+            continue
+
+        break
+    else:
+        return index, False, f"Chunk {index} falhou apos {MAX_RETRIES} tentativas. Download abortado."
 
         chunk_path = self.save_partial_chunk(metadata, index, data)
 
