@@ -121,6 +121,24 @@ Importante: entre computadores diferentes, nao use `127.0.0.1` como `--public-ho
 9. O Peer B valida o hash final.
 10. O Peer B registra todos os chunks e vira seed.
 
+## Testando downloads simultâneos (múltiplos peers)
+
+Para demonstrar o download paralelo, é necessário ter ao menos dois seeds antes de iniciar o leecher.
+Crie dois seeds com o mesmo arquivo (Peer A e Peer B) e depois suba um terceiro peer e baixe o arquivo:
+
+Terminal 4, Peer C:
+
+```bash
+python src/peer.py --peer-id peer-c --listen-host 127.0.0.1 --public-host 127.0.0.1 --port 6003 --tracker-host 127.0.0.1 --tracker-port 5000
+```
+
+No Peer C, escolha a opção `3`, informe o nome do arquivo e o número de workers paralelos.
+
+Nos logs do Peer C, chunks chegando de `peer-a` e `peer-b` intercalados e fora de ordem confirmam que o download paralelo está funcionando.
+Ao final, a opção `5` deve exibir `seed_count: 3`no arquivo testado.
+
+O número de workers pode ser ajustado conforme o cenário: mais workers aproveitam melhor redes com muitos peers disponíveis, mas podem causar sobrecarga em redes com poucos seeds ou alta latência.
+
 ## Menu do peer
 
 ```text

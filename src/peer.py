@@ -6,6 +6,7 @@ import random
 import socket
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 from constants import (
@@ -71,6 +72,7 @@ class LocalCatalog:
         safe_peer = hashlib.sha256(peer_id.encode("utf-8")).hexdigest()[:12]
         self.path = os.path.join(state_dir, f"catalog_{safe_peer}.json")
         self.data: Dict[str, Any] = {"files": {}}
+        self._lock = threading.Lock()
         self.load()
 
     def load(self) -> None:
@@ -83,8 +85,9 @@ class LocalCatalog:
         self.data.setdefault("files", {})
 
     def save(self) -> None:
-        with open(self.path, "w", encoding="utf-8") as fileobj:
-            json.dump(self.data, fileobj, indent=2, ensure_ascii=False)
+        with self._lock:
+            with open(self.path, "w", encoding="utf-8") as fileobj:
+                json.dump(self.data, fileobj, indent=2, ensure_ascii=False)
 
     def get(self, filename: str) -> Optional[Dict[str, Any]]:
         return self.data["files"].get(filename)
@@ -125,30 +128,32 @@ class LocalCatalog:
         chunk_hash: str,
         metadata: Dict[str, Any],
     ) -> None:
-        filename = metadata["filename"]
-        entry = self.data["files"].setdefault(filename, {
-            "filename": filename,
-            "path": None,
-            "file_size": int(metadata["file_size"]),
-            "chunk_size": int(metadata["chunk_size"]),
-            "total_chunks": int(metadata["total_chunks"]),
-            "file_hash": metadata["file_hash"],
-            "chunk_hashes": metadata.get("chunk_hashes", {}),
-            "completed": False,
-            "chunks": {},
-        })
+        with self._lock:
+            filename = metadata["filename"]
+            entry = self.data["files"].setdefault(filename, {
+                "filename": filename,
+                "path": None,
+                "file_size": int(metadata["file_size"]),
+                "chunk_size": int(metadata["chunk_size"]),
+                "total_chunks": int(metadata["total_chunks"]),
+                "file_hash": metadata["file_hash"],
+                "chunk_hashes": metadata.get("chunk_hashes", {}),
+                "completed": False,
+                "chunks": {},
+            })
 
-        entry["file_size"] = int(metadata["file_size"])
-        entry["chunk_size"] = int(metadata["chunk_size"])
-        entry["total_chunks"] = int(metadata["total_chunks"])
-        entry["file_hash"] = metadata["file_hash"]
-        entry["chunk_hashes"] = metadata.get("chunk_hashes", entry.get("chunk_hashes", {}))
-        entry["chunks"][str(chunk_index)] = {
-            "source": "partial_chunk",
-            "path": os.path.abspath(chunk_path),
-            "hash": chunk_hash,
-        }
-        self.save()
+            entry["file_size"] = int(metadata["file_size"])
+            entry["chunk_size"] = int(metadata["chunk_size"])
+            entry["total_chunks"] = int(metadata["total_chunks"])
+            entry["file_hash"] = metadata["file_hash"]
+            entry["chunk_hashes"] = metadata.get("chunk_hashes", entry.get("chunk_hashes", {}))
+            entry["chunks"][str(chunk_index)] = {
+                "source": "partial_chunk",
+                "path": os.path.abspath(chunk_path),
+                "hash": chunk_hash,
+            }
+            with open(self.path, "w", encoding="utf-8") as fileobj:
+                json.dump(self.data, fileobj, indent=2, ensure_ascii=False)
 
     def has_valid_chunk(self, filename: str, chunk_index: int) -> bool:
         entry = self.get(filename)
@@ -434,6 +439,8 @@ class PeerNode:
                 return data
 
     def save_partial_chunk(self, metadata: Dict[str, Any], chunk_index: int, data: bytes) -> str:
+        # Cada chunk eh salvo em um arquivo, o que permite que multiplas threads escrevam no disco ao mesmo tempo sem conflito,
+        # pois cada uma opera em um caminho de arquivo distinto.
         path = chunk_file_path(self.partial_dir, metadata["filename"], metadata["file_hash"], chunk_index)
         with open(path, "wb") as fileobj:
             fileobj.write(data)
@@ -456,7 +463,73 @@ class PeerNode:
         os.replace(temp_path, final_path)
         return final_path
 
-    def download_file(self, filename: str) -> Tuple[bool, str]:
+    def _download_single_chunk(
+        self,
+        filename: str,
+        index: int,
+        metadata: Dict[str, Any],
+    ) -> Tuple[int, bool, str]:
+        """Baixa, valida, salva no disco e anuncia ao tracker um unico chunk.
+        Este metodo eh executado em paralelo por multiplas threads (uma por chunk).
+        Cada thread opera sobre um indice de chunk diferente, portanto nao ha
+        conflito de escrita em disco.
+        """
+        chunk_hashes = metadata.get("chunk_hashes", {})
+        chunks = metadata.get("chunks", {})
+
+        # Se este peer ja possui o chunk (de um download anterior interrompido), pula sem baixar novamente.
+        if self.catalog.has_valid_chunk(filename, index):
+            print(f"[DOWNLOAD] Chunk {index} ja existe localmente. Pulando.")
+            return index, True, ""
+
+        # Escolhe um peer da swarm que possui este chunk (excluindo a si mesmo)
+        peers = chunks.get(str(index), [])
+        peer = self.choose_peer_for_chunk(peers)
+        if not peer:
+            return index, False, f"Nao ha outro peer disponivel para o chunk {index}."
+
+        print(f"[DOWNLOAD] Baixando chunk {index} de {peer['peer_id']} ({peer['host']}:{peer['port']})...")
+        try:
+            data = self.request_chunk(peer, filename, index)
+        except Exception as error:
+            return index, False, f"Falha ao baixar chunk {index}: {error}"
+        expected_hash = chunk_hashes.get(str(index))
+        actual_hash = sha256_bytes(data)
+        if expected_hash and actual_hash != expected_hash:
+            return index, False, f"Chunk {index} veio corrompido. Hash nao confere."
+
+        chunk_path = self.save_partial_chunk(metadata, index, data)
+
+        self.catalog.upsert_partial_chunk(
+            filename=filename,
+            chunk_index=index,
+            chunk_path=chunk_path,
+            chunk_hash=actual_hash,
+            metadata=metadata,
+        )
+
+            # Aqui o leecher ja ajuda a swarm: assim que tem um chunk valido,
+            # anuncia esse chunk ao tracker e pode servir esse pedaco para outros.
+        entry = self.catalog.get(filename)
+        assert entry is not None
+        response = self.register_chunk(filename, index, entry)
+        if response.get("status") == "success":
+            print(f"[LEECHER] Chunk {index} anunciado. Este peer ja pode enviar esse pedaco.")
+        else:
+            print(f"[LEECHER] Nao consegui anunciar chunk {index}: {response.get('message')}")
+
+        return index, True, ""
+
+    def download_file(self, filename: str, max_workers: int = 4) -> Tuple[bool, str]:
+        """Baixa um arquivo em paralelo, distribuindo os chunks entre multiplos peers.
+        Fluxo:
+          1. Consulta o tracker para obter metadados e lista de peers por chunk.
+          2. Identifica quais chunks ainda faltam (permite retomar downloads).
+          3. Dispara uma thread por chunk pendente (ate max_workers simultaneas).
+          4. Aguarda conclusao; na primeira falha, cancela as demais e retorna erro.
+          5. Monta o arquivo final a partir dos chunks e valida o hash global.
+          6. Reanuncia todos os chunks ao tracker: este peer passa a ser seed.
+        """
         success, result = self.search_file(filename)
         if not success:
             return False, result
@@ -469,49 +542,26 @@ class PeerNode:
         if not chunks:
             return False, "Arquivo encontrado, mas nao ha chunks disponiveis. Sem fonte ativa."
 
-        print(f"[DOWNLOAD] Arquivo '{filename}': {total_chunks} chunk(s). Seeds: {metadata.get('seed_count', 0)}")
+        print(
+            f"[DOWNLOAD] Arquivo '{filename}': {total_chunks} chunk(s) | "
+            f"Seeds: {metadata.get('seed_count', 0)} | Workers paralelos: {max_workers}"
+        )
 
-        for index in range(total_chunks):
-            if self.catalog.has_valid_chunk(filename, index):
-                print(f"[DOWNLOAD] Chunk {index} ja existe localmente. Pulando.")
-                continue
+        pending = [i for i in range(total_chunks) if not self.catalog.has_valid_chunk(filename, i)]
+        print(f"[DOWNLOAD] {len(pending)} chunk(s) precisam ser baixados.")
 
-            peers = chunks.get(str(index), [])
-            peer = self.choose_peer_for_chunk(peers)
-            if not peer:
-                return False, f"Nao ha outro peer disponivel para o chunk {index}."
+        # max_workers define o limite de downloads simultaneos; aumentar demais pode saturar a rede ou ser bloqueado pelos peers remotos.
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self._download_single_chunk, filename, index, metadata): index
+                for index in pending
+            }
+            for future in as_completed(futures):
+                index, ok, message = future.result()
+                if not ok:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    return False, message
 
-            print(f"[DOWNLOAD] Baixando chunk {index} de {peer['peer_id']} ({peer['host']}:{peer['port']})...")
-            try:
-                data = self.request_chunk(peer, filename, index)
-            except Exception as error:
-                return False, f"Falha ao baixar chunk {index}: {error}"
-
-            expected_hash = chunk_hashes.get(str(index))
-            actual_hash = sha256_bytes(data)
-            if expected_hash and actual_hash != expected_hash:
-                return False, f"Chunk {index} veio corrompido. Hash nao confere."
-
-            chunk_path = self.save_partial_chunk(metadata, index, data)
-            self.catalog.upsert_partial_chunk(
-                filename=filename,
-                chunk_index=index,
-                chunk_path=chunk_path,
-                chunk_hash=actual_hash,
-                metadata=metadata,
-            )
-
-            # Aqui o leecher ja ajuda a swarm: assim que tem um chunk valido,
-            # anuncia esse chunk ao tracker e pode servir esse pedaco para outros.
-            entry = self.catalog.get(filename)
-            assert entry is not None
-            response = self.register_chunk(filename, index, entry)
-            if response.get("status") == "success":
-                print(f"[LEECHER] Chunk {index} anunciado. Este peer ja pode enviar esse pedaco.")
-            else:
-                print(f"[LEECHER] Nao consegui anunciar chunk {index}: {response.get('message')}")
-
-        # Se chegou aqui, todos os chunks existem localmente.
         try:
             final_path = self.assemble_completed_file(metadata)
         except Exception as error:
@@ -603,7 +653,9 @@ def menu_loop(peer: PeerNode) -> None:
 
         elif option == "3":
             filename = input("Nome do arquivo: ").strip()
-            success, message = peer.download_file(filename)
+            workers_input = input("Numero de workers paralelos (Enter para padrao 4): ").strip()
+            max_workers = int(workers_input) if workers_input.isdigit() and int(workers_input) > 0 else 4
+            success, message = peer.download_file(filename, max_workers=max_workers)
             print(message)
 
         elif option == "4":
