@@ -469,45 +469,49 @@ class PeerNode:
         index: int,
         metadata: Dict[str, Any],
     ) -> Tuple[int, bool, str]:
-        """Baixa, valida, salva no disco e anuncia ao tracker um unico chunk.
-        Este metodo eh executado em paralelo por multiplas threads (uma por chunk).
-        Cada thread opera sobre um indice de chunk diferente, portanto nao ha
-        conflito de escrita em disco.
-        """
+        """Baixa, valida, salva no disco e anuncia ao tracker um unico chunk."""
         chunk_hashes = metadata.get("chunk_hashes", {})
         chunks = metadata.get("chunks", {})
 
-        # Se este peer ja possui o chunk (de um download anterior interrompido), pula sem baixar novamente.
         if self.catalog.has_valid_chunk(filename, index):
             print(f"[DOWNLOAD] Chunk {index} ja existe localmente. Pulando.")
             return index, True, ""
 
-    # Tenta baixar o chunk de peers diferentes em caso de corrupcao ou falha.
-    # quantas tentativas serao feitas antes de desistir:
-    MAX_RETRIES = 3
+        MAX_RETRIES = 3
+        data = None
+        actual_hash = None
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        peers = chunks.get(str(index), [])
-        peer = self.choose_peer_for_chunk(peers)
-        if not peer:
-            return index, False, f"Nao ha outro peer disponivel para o chunk {index}."
+        for attempt in range(1, MAX_RETRIES + 1):
+            peers = chunks.get(str(index), [])
+            peer = self.choose_peer_for_chunk(peers)
 
-        print(f"[DOWNLOAD] Chunk {index} — tentativa {attempt}/{MAX_RETRIES} via {peer['peer_id']} ({peer['host']}:{peer['port']})...")
-        try:
-            data = self.request_chunk(peer, filename, index)
-        except Exception as error:
-            print(f"[RETRY] Chunk {index} falhou na tentativa {attempt}: {error}")
-            continue
+            if not peer:
+                return index, False, f"Nao ha outro peer disponivel para o chunk {index}."
 
-        expected_hash = chunk_hashes.get(str(index))
-        actual_hash = sha256_bytes(data)
-        if expected_hash and actual_hash != expected_hash:
-            print(f"[RETRY] Chunk {index} corrompido na tentativa {attempt}. Tentando outro peer...")
-            continue
+            print(
+                f"[DOWNLOAD] Chunk {index} - tentativa {attempt}/{MAX_RETRIES} "
+                f"via {peer['peer_id']} ({peer['host']}:{peer['port']})..."
+            )
 
-        break
-    else:
-        return index, False, f"Chunk {index} falhou apos {MAX_RETRIES} tentativas. Download abortado."
+            try:
+                data = self.request_chunk(peer, filename, index)
+            except Exception as error:
+                print(f"[RETRY] Chunk {index} falhou na tentativa {attempt}: {error}")
+                continue
+
+            expected_hash = chunk_hashes.get(str(index))
+            actual_hash = sha256_bytes(data)
+
+            if expected_hash and actual_hash != expected_hash:
+                print(f"[RETRY] Chunk {index} corrompido na tentativa {attempt}. Tentando outro peer...")
+                continue
+
+            break
+        else:
+            return index, False, f"Chunk {index} falhou apos {MAX_RETRIES} tentativas. Download abortado."
+
+        if data is None or actual_hash is None:
+            return index, False, f"Chunk {index} nao foi baixado corretamente."
 
         chunk_path = self.save_partial_chunk(metadata, index, data)
 
@@ -519,18 +523,18 @@ class PeerNode:
             metadata=metadata,
         )
 
-            # Aqui o leecher ja ajuda a swarm: assim que tem um chunk valido,
-            # anuncia esse chunk ao tracker e pode servir esse pedaco para outros.
         entry = self.catalog.get(filename)
         assert entry is not None
+
         response = self.register_chunk(filename, index, entry)
+
         if response.get("status") == "success":
             print(f"[LEECHER] Chunk {index} anunciado. Este peer ja pode enviar esse pedaco.")
         else:
             print(f"[LEECHER] Nao consegui anunciar chunk {index}: {response.get('message')}")
 
         return index, True, ""
-
+    
     def download_file(self, filename: str, max_workers: int = 4) -> Tuple[bool, str]:
         """Baixa um arquivo em paralelo, distribuindo os chunks entre multiplos peers.
         Fluxo:

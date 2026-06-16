@@ -3,13 +3,13 @@ import json
 import socket
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, Any, List, Tuple
+from urllib.parse import unquote, urlparse
 
 from constants import TRACKER_PORT, PEER_TIMEOUT
 from protocol import send_json, read_json_line
 
-# Estrutura em memoria. Para trabalho de faculdade isso basta; uma versao real
-# poderia trocar esse dicionario por banco de dados.
 files_index: Dict[str, Dict[str, Any]] = {}
 peers_last_seen: Dict[str, Dict[str, Any]] = {}
 lock = threading.Lock()
@@ -203,6 +203,86 @@ def handle_status() -> Dict[str, Any]:
     return {"status": "success", "files": files, "peers": peers}
 
 
+
+#  API HTTP 
+
+class TrackerApiHandler(BaseHTTPRequestHandler):
+
+    def _send_json_response(self, status_code: int, payload: Dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self) -> None:
+        self._send_json_response(200, {"status": "success"})
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+
+        if path in ["/", "/api", "/api/health"]:
+            self._send_json_response(200, {
+                "status": "success",
+                "service": "tracker-api",
+                "message": "API do tracker online. Use /api/status, /api/files ou /api/peers.",
+            })
+            return
+
+        if path == "/api/status":
+            self._send_json_response(200, handle_status())
+            return
+
+        if path == "/api/files":
+            status = handle_status()
+            self._send_json_response(200, {"status": "success", "files": status.get("files", [])})
+            return
+
+        if path == "/api/peers":
+            status = handle_status()
+            self._send_json_response(200, {"status": "success", "peers": status.get("peers", [])})
+            return
+
+        if path.startswith("/api/files/"):
+            filename = unquote(path[len("/api/files/"):])
+            response = handle_search({"filename": filename})
+            self._send_json_response(200, response)
+            return
+
+        if path.startswith("/api/swarm/"):
+            filename = unquote(path[len("/api/swarm/"):])
+            response = handle_search({"filename": filename})
+            self._send_json_response(200, response)
+            return
+
+        self._send_json_response(404, {
+            "status": "error",
+            "message": "Endpoint nao encontrado.",
+            "available_endpoints": [
+                "GET /api/health",
+                "GET /api/status",
+                "GET /api/files",
+                "GET /api/files/<filename>",
+                "GET /api/peers",
+                "GET /api/swarm/<filename>",
+            ],
+        })
+
+    def log_message(self, format: str, *args: Any) -> None:
+        # Evita poluir o terminal do tracker a cada refresh do front.
+        return
+
+
+def start_tracker_api(host: str, port: int) -> None:
+    api_server = ThreadingHTTPServer((host, int(port)), TrackerApiHandler)
+    print(f"[TRACKER API ONLINE] HTTP em http://{host}:{port}/api/status")
+    api_server.serve_forever()
+
 def handle_client(conn: socket.socket, addr: Tuple[str, int]) -> None:
     try:
         with conn.makefile("rb") as fileobj:
@@ -248,14 +328,16 @@ def monitor_timeouts(timeout: int) -> None:
                 remove_peer_everywhere(peer_id)
 
 
-def start_tracker(host: str, port: int, timeout: int) -> None:
+def start_tracker(host: str, port: int, timeout: int, api_host: str, api_port: int, enable_api: bool) -> None:
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((host, int(port)))
     server.listen()
 
-    print(f"[TRACKER ONLINE] Escutando em {host}:{port}")
+    print(f"[TRACKER ONLINE] Escutando peers em {host}:{port}")
     threading.Thread(target=monitor_timeouts, args=(timeout,), daemon=True).start()
+    if enable_api:
+        threading.Thread(target=start_tracker_api, args=(api_host, api_port), daemon=True).start()
 
     while True:
         conn, addr = server.accept()
@@ -267,9 +349,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="0.0.0.0", help="Endereco em que o tracker escuta. Padrao: 0.0.0.0")
     parser.add_argument("--port", type=int, default=TRACKER_PORT, help="Porta do tracker. Padrao: 5000")
     parser.add_argument("--timeout", type=int, default=PEER_TIMEOUT, help="Timeout em segundos para remover peer offline.")
+    parser.add_argument("--api-host", default="0.0.0.0", help="Endereco da API HTTP do tracker. Padrao: 0.0.0.0")
+    parser.add_argument("--api-port", type=int, default=8000, help="Porta da API HTTP do tracker. Padrao: 8000")
+    parser.add_argument("--no-api", action="store_true", help="Desativa a API HTTP do tracker.")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    start_tracker(args.host, args.port, args.timeout)
+    start_tracker(args.host, args.port, args.timeout, args.api_host, args.api_port, not args.no_api)
